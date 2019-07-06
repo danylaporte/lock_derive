@@ -1,0 +1,20 @@
+[package]
+name = "lock_derive"
+version = "0.1.0"
+authors = ["Dany Laporte <dany_laporte@hotmail.com>"]
+edition = "2018"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "0.4"
+quote = "0.6"
+syn = { version = "0.15", features = [ "parsing" ]}
+
+[dev-dependencies]
+failure = "0.1"
+futures = "0.1"
+futures-locks = "0.3"
+lazy_static = "1.3"
+tokio = "0.1"

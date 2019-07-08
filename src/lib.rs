@@ -66,7 +66,7 @@ pub fn locks(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         }
     };
 
-    let name = s.name.clone();
+    let name = &s.name;
     let impl_resolve = s.impl_resolve();
     let impl_traits = s.impl_traits();
 
@@ -88,11 +88,7 @@ struct LockField {
 
 impl LockField {
     fn new_from_field(f: &Field, idx: usize) -> Result<Self> {
-        let name = f
-            .ident
-            .clone()
-            .expect("lock field must have a name.")
-            .clone();
+        let name = f.ident.clone().expect("lock field must have a name.");
 
         let ty = f.ty.clone();
 
@@ -104,16 +100,16 @@ impl LockField {
     }
 
     fn impl_resolve(&self, inner_code: TokenStream) -> TokenStream {
-        let name = self.name.clone();
+        let name = &self.name;
         let arg = self.arg_name();
-        let ty = self.ty.clone();
+        let ty = &self.ty;
 
         quote! { #name!(resolve #ty).and_then(move |#arg| #inner_code) }
     }
 
     fn impl_traits(&self, struct_name: Ident) -> TokenStream {
-        let name = self.name.clone();
-        let ty = self.ty.clone();
+        let name = &self.name;
+        let ty = &self.ty;
 
         quote! { #name! { traits #ty, #struct_name } }
     }
@@ -159,8 +155,8 @@ impl Struct {
     }
 
     fn impl_instantiate(&self) -> TokenStream {
-        let name = self.name.clone();
-        let names = self.fields.iter().map(|f| &f.name).cloned();
+        let name = &self.name;
+        let names = self.fields.iter().map(|f| &f.name);
         let args = self.fields.iter().map(|f| f.arg_name());
 
         quote! {
@@ -171,7 +167,7 @@ impl Struct {
     }
 
     fn impl_resolve(&self) -> TokenStream {
-        let name = self.name.clone();
+        let name = &self.name;
         let mut inner_code = Some(self.impl_instantiate());
 
         for field in &self.fields {

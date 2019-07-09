@@ -5,20 +5,18 @@ deadlocks by always sorting the locks in the same order.
 # Example
 
 ```
+#![feature(proc_macro_hygiene)]
+
 use failure::format_err;
 use futures_locks::{RwLock, RwLockReadGuard};
 use tokio::executor::current_thread::block_on_all;
 
-// this macro is a receipe on how to support a lock and what to implement
+// this macro is a recipe on how to support a lock and what to implement
 // for a lock on the lock struct
 macro_rules! accounts {
-    // Invoked by the derive to find and initiate the lock request.
-    (resolve $field:ty) => {
-        ACCOUNTS.read().map_err(|_| format_err!("Lock Error"))
-    };
-
-    // Invoked by the derive to implement traits on the struct based on the locks available.
-    (traits $field:ty, $struct:ty) => {
+    (ty read) => { RwLockReadGuard<i32> };
+    (resolve read) => { ACCOUNTS.read().map_err(|_| format_err!("Lock error")) };
+    (traits $access:ident $struct:ty) => {
         impl AsRef<i32> for $struct {
             fn as_ref(&self) -> &i32 {
                 &self.accounts
@@ -32,15 +30,9 @@ lazy_static::lazy_static! {
     static ref ACCOUNTS: RwLock<i32> = RwLock::new(10);
 }
 
-#[derive(lock_derive::Locks)]
-struct Locks {
-    accounts: RwLockReadGuard<i32>,
-}
-
 fn main() {
-    let future = Locks::resolve();
+    let future = lock_derive::locks!(read: [accounts]);
     let locks = block_on_all(future).unwrap();
-
     assert_eq!(10, *locks.accounts);
     assert_eq!(10, *locks.as_ref());
 }
@@ -50,144 +42,167 @@ fn main() {
 extern crate proc_macro;
 extern crate proc_macro2;
 
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quote::quote;
-use syn::parse::Result;
-use syn::{parse_macro_input, Data, DeriveInput, Error, Field, Fields, Ident, Type};
+use std::collections::HashMap;
+use syn::parse::{Parse, ParseStream, Result};
+use syn::punctuated::Punctuated;
+use syn::{bracketed, parse_macro_input, Error, Ident, Token};
 
-#[proc_macro_derive(Locks)]
-pub fn locks(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    let derive_input = parse_macro_input!(input as DeriveInput);
-
-    let s = match Struct::from_derive_input(derive_input) {
-        Ok(s) => s,
-        Err(e) => {
-            return e.to_compile_error().into();
-        }
-    };
-
-    let name = &s.name;
-    let impl_resolve = s.impl_resolve();
-    let impl_traits = s.impl_traits();
-
-    quote! (
-        impl #name {
-            #impl_resolve
-        }
-
-        #impl_traits
-    )
-    .into()
+#[proc_macro]
+pub fn locks(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let args = parse_macro_input!(item as Args);
+    write_all(&args).into()
 }
 
-struct LockField {
-    idx: usize,
-    name: Ident,
-    ty: Type,
+struct Args {
+    items: Vec<(Ident, ReadWrite)>,
 }
 
-impl LockField {
-    fn new_from_field(f: &Field, idx: usize) -> Result<Self> {
-        let name = f.ident.clone().expect("lock field must have a name.");
+impl Parse for Args {
+    fn parse(stream: ParseStream) -> Result<Self> {
+        let mut read = None;
+        let mut write = None;
 
-        let ty = f.ty.clone();
+        while !stream.is_empty() {
+            let name: Ident = stream.parse()?;
+            let _: Token![:] = stream.parse()?;
+            let s = name.to_string();
+            let s = s.as_str();
 
-        Ok(LockField { idx, name, ty })
-    }
+            let content;
+            bracketed!(content in stream);
 
-    fn arg_name(&self) -> Ident {
-        Ident::new(&format!("__a{}", self.idx), self.name.span())
-    }
+            let punctuated = <Punctuated<Ident, Token![,]>>::parse_terminated(&content)?;
+            let vec = punctuated.into_iter().collect::<Vec<_>>();
 
-    fn impl_resolve(&self, inner_code: TokenStream) -> TokenStream {
-        let name = &self.name;
-        let arg = self.arg_name();
-        let ty = &self.ty;
+            let old = match s {
+                "read" => read.replace(vec),
+                "write" => write.replace(vec),
+                _ => return Err(Error::new(name.span(), "Expected `read` or `write`.")),
+            };
 
-        quote! { #name!(resolve #ty).and_then(move |#arg| #inner_code) }
-    }
-
-    fn impl_traits(&self, struct_name: Ident) -> TokenStream {
-        let name = &self.name;
-        let ty = &self.ty;
-
-        quote! { #name! { traits #ty, #struct_name } }
-    }
-}
-
-struct Struct {
-    fields: Vec<LockField>,
-    name: Ident,
-}
-
-impl Struct {
-    fn from_derive_input(input: DeriveInput) -> Result<Self> {
-        let name = input.ident;
-
-        let data_struct = match input.data {
-            Data::Struct(s) => s,
-            _ => {
+            if old.is_some() {
                 return Err(Error::new(
                     name.span(),
-                    "Only struct are supported by lock derive.",
-                ))
-            }
-        };
-
-        let mut fields = Vec::new();
-
-        match data_struct.fields {
-            Fields::Named(f) => {
-                for (idx, f) in f.named.iter().enumerate() {
-                    fields.push(LockField::new_from_field(f, idx)?);
-                }
-            }
-            _ => {
-                return Err(Error::new(
-                    name.span(),
-                    "Only struct with named fields are supported.",
-                ))
-            }
-        };
-
-        fields.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(Struct { fields, name })
-    }
-
-    fn impl_instantiate(&self) -> TokenStream {
-        let name = &self.name;
-        let names = self.fields.iter().map(|f| &f.name);
-        let args = self.fields.iter().map(|f| f.arg_name());
-
-        quote! {
-            futures::future::ok(#name {
-                #(#names: #args,)*
-            })
-        }
-    }
-
-    fn impl_resolve(&self) -> TokenStream {
-        let name = &self.name;
-        let mut inner_code = Some(self.impl_instantiate());
-
-        for field in &self.fields {
-            inner_code = Some(field.impl_resolve(inner_code.take().expect("inner_code")));
-        }
-
-        let inner_code = inner_code.expect("inner_code");
-
-        quote! {
-            fn resolve() -> impl futures::Future<Item = #name, Error = failure::Error> {
-                use futures::future::Future;
-
-                #inner_code
+                    format!("`{}` found more than once.", s),
+                ));
             }
         }
+
+        let mut set = HashMap::new();
+        let read = read
+            .unwrap_or_else(Vec::new)
+            .into_iter()
+            .map(|r| (r, ReadWrite::Read));
+
+        let write = write
+            .unwrap_or_else(Vec::new)
+            .into_iter()
+            .map(|w| (w, ReadWrite::Write));
+
+        let items = read.chain(write);
+
+        for (ident, read_write) in items {
+            let span = ident.span();
+
+            if set.insert(ident, read_write).is_some() {
+                return Err(Error::new(span, "Found multiple times."));
+            }
+        }
+
+        let mut items = set.into_iter().collect::<Vec<_>>();
+        items.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        Ok(Self { items })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReadWrite {
+    Read,
+    Write,
+}
+
+impl ReadWrite {
+    fn ident(self) -> Ident {
+        Ident::new(
+            match self {
+                ReadWrite::Read => "read",
+                ReadWrite::Write => "write",
+            },
+            Span::call_site(),
+        )
+    }
+}
+
+fn write_resolve(args: &Args) -> TokenStream {
+    let fields = args.items.iter().enumerate().map(|(i, t)| {
+        let name = &t.0;
+        let v = Ident::new(&format!("__v{}", i), Span::call_site());
+        quote! { #name: #v }
+    });
+
+    let mut inner_code = Some(quote! { Ok(Locks { #(#fields,)* }) });
+
+    for (i, t) in args.items.iter().enumerate() {
+        let name = &t.0;
+        let t = t.1.ident();
+        let v = Ident::new(&format!("__v{}", i), Span::call_site());
+        let code = inner_code.take().expect("inner_code");
+
+        inner_code = Some(quote! { #name!(resolve #t).and_then(|#v| #code) });
     }
 
-    fn impl_traits(&self) -> TokenStream {
-        let traits = self.fields.iter().map(|f| f.impl_traits(self.name.clone()));
+    let code = inner_code.expect("inner_code");
 
-        quote! { #(#traits)* }
+    quote! {
+        impl Locks {
+            fn resolve() -> impl futures::Future<Item = Self, Error = failure::Error> {
+                use futures::Future;
+
+                #code
+            }
+        }
     }
+}
+
+fn write_struct(args: &Args) -> TokenStream {
+    let fields = args.items.iter().map(|t| {
+        let n = &t.0;
+        let ident = &t.1.ident();
+
+        quote! { #n: #n!(ty #ident) }
+    });
+
+    quote! {
+        struct Locks {
+            #(#fields,)*
+        }
+    }
+}
+
+fn write_traits(args: &Args) -> TokenStream {
+    let fields = args.items.iter().map(|t| {
+        let n = &t.0;
+        let ident = &t.1.ident();
+
+        quote! { #n!{ traits #ident Locks  } }
+    });
+
+    quote! { #(#fields)* }
+}
+
+fn write_all(args: &Args) -> TokenStream {
+    let locks = write_struct(args);
+    let resolve = write_resolve(args);
+    let traits = write_traits(args);
+
+    quote! {{
+        #locks
+        #resolve
+        #traits
+
+        Locks::resolve()
+    }}
 }
